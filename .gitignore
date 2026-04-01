@@ -5,6 +5,9 @@
 /datasets
 /mem_prof
 /tmp
+/.umls
+/.mem_prof
+/.plot
 
 /test/scripts
 /test/test_data

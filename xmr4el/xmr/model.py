@@ -1,3 +1,4 @@
+import json
 import os
 import joblib
 import pickle
@@ -9,6 +10,7 @@ import numpy as np
 
 from xmr4el import get_logger, set_verbosity
 from numpy import asarray, int32, argpartition, argsort, float32
+from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from memory_profiler import profile
@@ -25,7 +27,7 @@ os.environ["JOBLIB_TEMP_FOLDER"] = "/tmp"
 warnings.filterwarnings("ignore", message=".*does not have valid feature names.*")
 
 
-class XModel():
+class XModel:
     
     def __init__(self, 
                  vectorizer_config: dict = None,
@@ -279,6 +281,16 @@ class XModel():
         setattr(model, "_text_encoder", text_encoder)
         
         return model
+    
+    @classmethod
+    def load_config(cls, path: str | Path) -> object:
+        path = Path(path)
+
+        with open(path, "r") as f:
+            data = json.load(f)
+        
+        return XModel(**data)
+        
     
     def _fit(self, X_text, Y_text):
         """Returns embeddings: ndarray"""

@@ -246,10 +246,11 @@ class MLModel():
         return model
         
     def __str__(self):
-        _str = f"Cluster Model: {"✔" if self.cluster_model is not None else "✖"}\n" \
-                f"Matcher Model: {"✔" if self.matcher_model is not None else "✖"}\n" \
-                f"Ranker Model: {"✔" if self.ranker_model is not None else "✖"}\n" 
-        return _str
+        return (
+            f"Cluster Model: {self.cluster_model or 'None'}\n"
+            f"Matcher Model: {self.matcher_model or 'None'}\n"
+            f"Ranker Model: {self.ranker_model or 'None'}\n"
+        )
     
     # @profile
     def fused_predict(self, X, Z, C, alpha=0.5, batch_size=32768,
