@@ -196,3 +196,10 @@ Add the export command to `.venv/bin/activate` if you prefer a persistent config
 
 - Paper: in progress.
 - Implementation: functional but still evolving. Contributions and experimental feedback are welcome – see [`CONTRIBUTING.md`](CONTRIBUTING.md) for guidelines.
+
+docker run -d \
+  --name umls_postgres \
+  -p 5432:5432 \
+  -v /Users/vedor/Faculdade/research/xmr4el/.db:/var/lib/postgresql \
+  -v /Users/vedor/Faculdade/research/xmr4el/.umls:/umls \
+  umls_postgres

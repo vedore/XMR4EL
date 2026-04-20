@@ -8,6 +8,7 @@
 /.umls
 /.mem_prof
 /.plot
+/.db
 
 /test/scripts
 /test/test_data

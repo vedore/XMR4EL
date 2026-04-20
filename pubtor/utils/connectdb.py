@@ -1,40 +1,56 @@
 import psycopg2
 
-class connectdb():
+from pathlib import Path
+
+from pubtor.db.mrconso import MRCONSO
+
+
+class ConnectDB:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    QUERIES_DIR = BASE_DIR / "queries"
     
     def __init__(self, conn=None):
         self.conn = conn
         self.cur = conn.cursor()
     
     @classmethod
-    def connect(cls, 
-                dbname="umls_db", 
-                user="user",
-                password="pass",
-                host="localhost",
-                port=5432
-                ):
+    def connect(
+        cls, 
+        dbname="umls_db", 
+        user="user",
+        password="pass",
+        host="umls_postgres",
+        port=5432
+        ):
         
         conn = psycopg2.connect(
             dbname=dbname,
             user=user,
             password=password,
-            host=host,  # or "umls_postgres" if using docker network
+            host=host,
             port=port
         )
         
         return cls(conn)
     
-    def execute(self, query, params=None):
+    def search_one(self, query_file, params):
+        query = self.load_sql(query_file)
         self.cur.execute(query, params)
-        self.conn.commit()
-        
-    def fetchall(self):
-        return self.cur.fetchall()
+        return self.cur.fetchone()
+
+    def find_mrconso_by_cui(self, cui):
+        row = self.search_one("find_mrconso_by_cui.sql", (cui, ))
+        return MRCONSO(*row) if row else None
     
     def close(self):
-        self.cur.close()
-        self.conn.close()
+        if self.cur:
+            self.cur.close()
+        if self.conn:
+            self.conn.close()
+
+    @classmethod
+    def load_sql(cls, filename: str) -> str:
+        return (cls.QUERIES_DIR / filename).read_text(encoding="utf-8")
 
     # Context manager support
     def __enter__(self):
@@ -42,22 +58,3 @@ class connectdb():
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-
-class run():
-    
-    # Using try/finally
-    db = connectdb.connect()
-    try:
-        db.execute("CREATE TABLE IF NOT EXISTS umls_concepts (cui VARCHAR(10) PRIMARY KEY, name TEXT, definition TEXT)")
-    finally:
-        db.close()
-
-
-    # Using with statement (recommended)
-    with connectdb.connect() as db:
-        db.execute("INSERT INTO umls_concepts (cui, name, definition) VALUES (%s, %s, %s)",
-                ("C0000005", "Aspirin", "A common painkiller"))
-        db.execute("SELECT * FROM umls_concepts")
-        rows = db.fetchall()
-        print(rows)
-    # Automatically closes connection and cursor
