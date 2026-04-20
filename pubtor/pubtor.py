@@ -1,18 +1,10 @@
 from pathlib import Path
 from pubtor.db.mrconso import MRCONSO
-from pubtor.utils.connectdb import ConnectDB
+from pubtor.db.connectdb import ConnectDB
 
 class Pubtor:
     BASE_DIR = Path(__file__).resolve().parent.parent
     QUERIES_DIR = BASE_DIR / "queries"
-
-    params = {
-        "dbname": "umls_db",
-        "user": "user",
-        "password": "pass",
-        "host": "localhost",
-        "port": 5432
-        }
 
     def __init__(self,
                  params=params):
