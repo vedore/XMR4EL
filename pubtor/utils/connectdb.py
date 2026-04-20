@@ -6,8 +6,6 @@ from pubtor.db.mrconso import MRCONSO
 
 
 class ConnectDB:
-    BASE_DIR = Path(__file__).resolve().parent.parent
-    QUERIES_DIR = BASE_DIR / "queries"
     
     def __init__(self, conn=None):
         self.conn = conn
@@ -32,25 +30,6 @@ class ConnectDB:
         )
         
         return cls(conn)
-    
-    def search_one(self, query_file, params):
-        query = self.load_sql(query_file)
-        self.cur.execute(query, params)
-        return self.cur.fetchone()
-
-    def find_mrconso_by_cui(self, cui):
-        row = self.search_one("find_mrconso_by_cui.sql", (cui, ))
-        return MRCONSO(*row) if row else None
-    
-    def close(self):
-        if self.cur:
-            self.cur.close()
-        if self.conn:
-            self.conn.close()
-
-    @classmethod
-    def load_sql(cls, filename: str) -> str:
-        return (cls.QUERIES_DIR / filename).read_text(encoding="utf-8")
 
     # Context manager support
     def __enter__(self):
