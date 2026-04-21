@@ -9,6 +9,8 @@
 /.mem_prof
 /.plot
 /.db
+/datasets
+/.pubtor
 
 /test/scripts
 /test/test_data

@@ -1,205 +1,451 @@
-# XMR4EL – eXtreme Multi-Label Ranking for Entity Linking
+# XMR4EL
 
-XMR4EL is a research-friendly framework that extends the [PECOS](https://github.com/amzn/pecos) pipeline for extreme multi-label ranking (XMR). It is designed to help you build, evaluate, and iterate on entity linking systems that must choose from very large label spaces. Although our primary focus is biomedical entity linking, every component is modular so you can plug in alternative algorithms or apply the framework to any XMR-ready dataset.
+XMR4EL is a research codebase for entity linking with very large label spaces using an extreme multi-label ranking pipeline. The code centers on a configurable `XModel` that combines text featurization, label embedding construction, clustering, matcher training, and per-label ranking into one hierarchical workflow.
 
-## Table of contents
-1. [Key ideas](#key-ideas)
-2. [Installation](#installation)
-3. [Repository layout](#repository-layout)
-4. [How the pipeline works](#how-the-pipeline-works)
-5. [Training a model](#training-a-model)
-6. [Running inference](#running-inference)
-7. [Saving and loading models](#saving-and-loading-models)
-8. [Customising components](#customising-components)
-9. [Input data expectations](#input-data-expectations)
-10. [Working with Docker](#working-with-docker)
-11. [Status](#status)
+This repository is currently oriented toward experimentation rather than polished product usage. The implementation and `_test/` scripts show two main data flows:
 
-## Key ideas
+- label-centric training from grouped mention files plus a label file
+- PubTator-based training and evaluation for biomedical entity linking
 
-- **Hierarchical modelling** – Large label sets are handled by recursively clustering labels into a tree. At prediction time the tree is traversed top-down to focus computation on the most promising label subsets (`xmr4el/xmr/base.py`).
+Where this README describes behavior as "inferred", that behavior is a reasonable reading of the code structure but not explicitly documented in the repository itself.
 
-- **Flexible featurisation** – Text is converted to dense and sparse features through a configurable pipeline composed of vectorisers, transformers, and dimensionality reducers (`xmr4el/featurization`).
+## Project Goal
 
-- **Label-aware ranking** – The framework creates label embeddings (PIFA) and trains ranking models that fuse matcher and ranker scores for better retrieval quality (`xmr4el/models`).
+The implemented goal of the repository is to train and evaluate entity linking systems that must choose from a large concept inventory. Instead of scoring every label independently, the code:
 
-- **Swappable components** – Every stage (clustering, matcher, ranker) is configured through lightweight wrappers so you can experiment without editing the core training loop.
+1. converts text into feature vectors
+2. builds label embeddings from the training data
+3. clusters labels into a hierarchy
+4. trains matcher models to route queries through that hierarchy
+5. optionally trains per-label rankers to refine scores
 
-## Installation
+The core orchestration class is [`XModel`](xmr4el/xmr/model.py), which delegates the hierarchical training logic to [`HierarchicaMLModel`](xmr4el/xmr/base.py).
 
-> **Python**: 3.12
+## Pipeline
 
-Install the package directly from GitHub:
+This is the current training and inference flow implemented in the code.
 
-## Install As An Package
+### 1. Data loading and preprocessing
+
+Implemented in [`xmr4el/featurization/preprocessor.py`](xmr4el/featurization/preprocessor.py).
+
+Two input styles are supported by code:
+
+- Label-centric TSV + label file:
+  - `Preprocessor.load_data_labels_from_file(train_filepath, labels_filepath)`
+  - reads a tab-separated file with `group_id` and `text`
+  - groups all texts with the same `group_id`
+  - aligns each group with one concept ID from the label file
+  - returns:
+    - `corpus`: `List[List[str]]`
+    - `labels`: `List[str]`
+
+- PubTator:
+  - `Preprocessor.load_pubtator_file(pubtator_filepath)`
+  - flattens each annotation into `"mention [SEP] context"` plus its CUI
+  - `Preprocessor.organize_pubtator_output(...)` can then regroup those examples by label for `XModel.train`
+
+There is also `load_pubtator_for_mention_embeddings`, which returns richer mention records including offsets and semantic types. That utility exists in the code, but the main `XModel` training path uses the grouped-label flow.
+
+### 2. Text featurization
+
+Implemented in [`xmr4el/featurization/text_encoder.py`](xmr4el/featurization/text_encoder.py) and the wrappers under [`xmr4el/models/featurization_wrapper/`](xmr4el/models/featurization_wrapper).
+
+`TextEncoder` supports four modes controlled by `emb_flag`:
+
+- `1`: TF-IDF only
+- `2`: TF-IDF + transformer embeddings
+- `3`: transformer embeddings only
+- `4`: split each input on `[SEP]`, encode one side with a transformer and the other with TF-IDF
+
+Implemented featurization backends visible in the repository include:
+
+- vectorizers:
+  - `tfidf`
+- dimensionality reduction:
+  - `sklearntruncatedsvd`
+- transformers:
+  - sentence-transformer based wrappers such as `sentencetbiobert`
+  - BioBERT-style naming also appears in the wrapper defaults
+
+Inference note:
+- the transformer wrapper automatically uses CUDA when `torch.cuda.is_available()` is true; otherwise it runs on CPU
+
+### 3. Label embedding construction
+
+Implemented in [`xmr4el/featurization/label_embedding_factory.py`](xmr4el/featurization/label_embedding_factory.py).
+
+During `XModel._fit(...)`:
+
+1. grouped texts are flattened with `Preprocessor.prepare_data_older(...)`
+2. a multilabel indicator matrix `Y` is built from the grouped labels
+3. PIFA-style label embeddings `Z` are computed from the encoded training features
+
+This part of the pipeline is explicit in code and is central to the later clustering stage.
+
+### 4. Hierarchy construction
+
+Implemented in [`xmr4el/clustering/model.py`](xmr4el/clustering/model.py), [`xmr4el/clustering/train.py`](xmr4el/clustering/train.py), and [`xmr4el/xmr/base.py`](xmr4el/xmr/base.py).
+
+The code clusters label embeddings rather than raw texts. `ClusteringTrainer.train(...)`:
+
+- trains a clustering model over the label embedding matrix `Z`
+- removes clusters that fall below `min_leaf_size`
+- produces a sparse label-to-cluster assignment matrix `C_node`
+
+Implemented clustering wrappers visible in the repository include:
+
+- `sklearnagglomerativeclustering`
+- `sklearnkmeans`
+- `sklearnminibatchkmeans`
+- `balancedkmeans`
+- FAISS- and RAPIDS-related code also exists in the clustering wrapper module
+
+Inferred behavior:
+- the repository is structured for hierarchical traversal across layers, but the README-level abstraction is safer than documenting every internal branching detail because that logic is spread across `HierarchicaMLModel`
+
+### 5. Matcher training
+
+Implemented in [`xmr4el/matcher/model.py`](xmr4el/matcher/model.py) and [`xmr4el/matcher/train.py`](xmr4el/matcher/train.py).
+
+The matcher learns to predict cluster assignments from instance features:
+
+- `MatcherTrainer.train(...)` projects instance-label assignments into cluster space
+- it binarizes that cluster membership target matrix
+- it trains a one-vs-rest classifier over clusters
+
+### 6. Ranker training
+
+Implemented in [`xmr4el/ranker/model.py`](xmr4el/ranker/model.py) and [`xmr4el/ranker/train.py`](xmr4el/ranker/train.py).
+
+The ranker stage is optional per layer, controlled by `ranker_every_layer` and `is_last_layer`.
+
+Current implementation details:
+
+- rankers are trained per label
+- training data for each label is built from candidate mentions associated with the label's cluster
+- negatives are selected with a curriculum strategy using random, prototype, and inner-product-based sampling
+- incremental training relies on classifier types that support `partial_fit`
+
+The shipped base config uses `sklearnsgdclassifier` for the ranker, which matches that incremental path.
+
+### 7. Inference
+
+Implemented in [`xmr4el/xmr/model.py`](xmr4el/xmr/model.py) and [`xmr4el/xmr/base.py`](xmr4el/xmr/base.py).
+
+At prediction time:
+
+1. query texts are encoded with the trained `TextEncoder`
+2. the hierarchical model produces candidate routes and scores
+3. scores can be fused using matcher and ranker outputs
+4. `XModel.predict(...)` supports:
+   - `beam_size`
+   - `topk`
+   - `fusion`
+   - `topk_mode`
+   - `topk_inside_global`
+
+Current behavior visible in code:
+
+- `topk_mode="per_leaf"` returns the hierarchical model output directly
+- the alternate path collects candidate labels from visited leaves and re-ranks them using cosine similarity against the stored label embeddings
+
+## Repository Layout
+
+This section documents the folders and files that currently matter most to a new developer.
+
+### Core package
+
+- [`xmr4el/xmr/`](xmr4el/xmr)
+  - top-level orchestration and hierarchical model logic
+  - start with:
+    - [`model.py`](xmr4el/xmr/model.py)
+    - [`base.py`](xmr4el/xmr/base.py)
+
+- [`xmr4el/featurization/`](xmr4el/featurization)
+  - dataset loading, preprocessing, encoding, and label embeddings
+  - key files:
+    - [`preprocessor.py`](xmr4el/featurization/preprocessor.py)
+    - [`text_encoder.py`](xmr4el/featurization/text_encoder.py)
+    - [`label_embedding_factory.py`](xmr4el/featurization/label_embedding_factory.py)
+
+- [`xmr4el/clustering/`](xmr4el/clustering)
+  - label clustering pipeline
+  - key files:
+    - [`model.py`](xmr4el/clustering/model.py)
+    - [`train.py`](xmr4el/clustering/train.py)
+
+- [`xmr4el/matcher/`](xmr4el/matcher)
+  - candidate routing / matcher training
+  - key files:
+    - [`model.py`](xmr4el/matcher/model.py)
+    - [`train.py`](xmr4el/matcher/train.py)
+
+- [`xmr4el/ranker/`](xmr4el/ranker)
+  - per-label ranker training
+  - key files:
+    - [`model.py`](xmr4el/ranker/model.py)
+    - [`train.py`](xmr4el/ranker/train.py)
+
+- [`xmr4el/models/`](xmr4el/models)
+  - wrappers around vectorizers, transformers, classifiers, clustering models, and dimensionality reduction
+  - important subfolders:
+    - [`classifier_wrapper/`](xmr4el/models/classifier_wrapper)
+    - [`cluster_wrapper/`](xmr4el/models/cluster_wrapper)
+    - [`featurization_wrapper/`](xmr4el/models/featurization_wrapper)
+
+- [`xmr4el/utils/`](xmr4el/utils)
+  - helper utilities
+  - notable files:
+    - [`temp_store.py`](xmr4el/utils/temp_store.py)
+    - [`pubtator_splits.py`](xmr4el/utils/pubtator_splits.py)
+    - [`config.py`](xmr4el/utils/config.py)
+
+### Config and scripts
+
+- [`.models/xmr4el_base_config.json`](.models/xmr4el_base_config.json)
+  - the only shipped model config in the repository
+  - used by `XModel.load_config(...)`
+
+- [`_test/xmr4el/`](_test/xmr4el)
+  - runnable experiment and evaluation scripts
+  - despite the name, these are closer to example scripts than a conventional automated test suite
+
+- [`_test/scripts/sweep_eval.sh`](_test/scripts/sweep_eval.sh)
+  - convenience shell script for evaluation sweeps
+
+### Data and auxiliary assets
+
+- [`datasets/`](datasets)
+  - dataset storage area used by the repository
+
+- [`data/`](data)
+  - additional data directory used by local scripts
+
+- [`pubtor/`](pubtor)
+  - small UMLS/PostgreSQL helper package
+  - includes:
+    - database connection code
+    - SQL query files
+    - repository and knowledge-base wrappers for UMLS concept retrieval
+
+- [`umls_entity_linking.sql`](umls_entity_linking.sql)
+  - SQL asset related to the UMLS/PostgreSQL support files
+
+- [`postgres.dockerfile`](postgres.dockerfile)
+  - PostgreSQL container file associated with the UMLS helper code
+
+- [`xmr4el.dockerfile`](xmr4el.dockerfile)
+  - project Dockerfile
+
+## Setup
+
+These instructions are based only on files that exist in the repository.
+
+### Python
+
+`pyproject.toml` requires:
+
+- Python `>=3.12`
+
+### Install the package
+
+From the repository root:
 
 ```bash
-pip install git+https://github.com/lasigeBioTM/XMR4EL.git
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e .
 ```
 
-All runtime dependencies are listed in [`requirements.txt`](requirements.txt).
+Notes:
 
-### GPU support
+- [`pyproject.toml`](pyproject.toml) is the package metadata source of truth
+- [`requirements.txt`](requirements.txt) exists, but it is not identical to `pyproject.toml`
+- the dependency set is environment-sensitive and includes heavy ML dependencies such as `torch`, `sentence-transformers`, `faiss-cpu`, and RAPIDS CUDA packages
 
-The repository contains CUDA-ready configurations (11.4 – 11.8). RAPIDS-backed GPU models have been validated with the provided Docker image.
+Practical implication:
+- if you are setting up a CPU-only development environment, inspect `pyproject.toml` carefully before installation because the declared dependencies include CUDA-targeted RAPIDS packages
 
-## Repository layout
+### Optional UMLS/PostgreSQL utilities
 
-xmr4el/
-├── featurization/        # Text encoders, preprocessing utilities, label embeddings
-├── clustering/           # Clustering wrappers used to build the hierarchical tree
-├── matcher/              # Candidate generation models
-├── ranker/               # Ranking algorithms for leaf scoring
-├── models/               # Component factories and configuration helpers
-└── xmr/                  # Hierarchical model, training loop, persistence utilities
+If you need the `pubtor` utilities, also inspect:
 
-Test fixtures live under [`test/test_data`](test/test_data) and are useful when experimenting with the API.
+- [`db_params.json`](db_params.json)
+- [`postgres.dockerfile`](postgres.dockerfile)
+- [`umls_entity_linking.sql`](umls_entity_linking.sql)
 
-## How the pipeline works
+The code shows PostgreSQL access through `psycopg2`, although that dependency is not declared in `pyproject.toml`.
 
-1. **Preprocessing** – Raw training files are grouped by label, producing lists of synonyms per concept. See `Preprocessor.load_data_labels_from_file` for the exact behaviour (`xmr4el/featurization/preprocessor.py`).
+## Usage
 
-2. **Text encoding** – `TextEncoder` builds sparse (e.g., TF–IDF) and dense (e.g., BioBERT) representations according to the chosen configuration (`xmr4el/featurization/text_encoder.py`). Optional dimensionality reduction can be applied before training.
+The repository does not currently expose a polished CLI entrypoint. The most reliable usage examples are the Python API and the `_test/xmr4el/*.py` scripts.
 
-3. **Label embeddings** – `LabelEmbeddingFactory` converts grouped texts into a binary label matrix and produces PIFA label embeddings (`xmr4el/featurization/label_embedding_factory.py`).
+### Load a shipped config
 
-4. **Hierarchical tree building** – `HierarchicaMLModel` recursively clusters labels, trains matchers to route queries, and fits ranking models (`xmr4el/xmr/base.py`).
+```python
+from xmr4el.xmr.model import XModel
 
-5. **Prediction** – Queries are encoded with the trained `TextEncoder`, routed through the tree, and scored. Fusion strategies combine matcher and ranker outputs to produce the final top-*k* predictions.
+xmodel = XModel.load_config(".models/xmr4el_base_config.json")
+```
 
-The orchestration class [`XModel`](xmr4el/xmr/model.py) glues these stages together so you can train and evaluate an end-to-end system with a handful of method calls.
+### Train from grouped text files
 
-## Training a model
+This path is implemented by `Preprocessor.load_data_labels_from_file(...)`.
 
 ```python
 from xmr4el.featurization.preprocessor import Preprocessor
 from xmr4el.xmr.model import XModel
 
-# 1. Load synonym groups and labels from disk
-paths = {
-    "train": "data/raw/mesh_data/bc5cdr/train_bc5cdr.txt",
-    "labels": "data/raw/mesh_data/medic/labels.txt",
-}
-dataset = Preprocessor.load_data_labels_from_file(paths["train"], paths["labels"])
-X_text, Y_labels = dataset["corpus"], dataset["labels"]
-
-# 2. Describe the components you want to use
-model = XModel(
-    vectorizer_config={"type": "tfidf"},
-    transformer_config={"type": "sentencetbiobert", "kwargs": {"batch_size": 400}},
-    clustering_config={"type": "sklearnminibatchkmeans", "kwargs": {"n_clusters": 256}},
-    matcher_config={"type": "linear_l2"},
-    ranker_config={"type": "sklearnlogisticregression"},
-    min_leaf_size=20,
-    ranker_every_layer=True,
-    n_workers=8,
+train_data = Preprocessor.load_data_labels_from_file(
+    train_filepath="path/to/train.tsv",
+    labels_filepath="path/to/labels.txt",
 )
 
-# 3. Train
-model.train(X_text, Y_labels)
+X_train = train_data["corpus"]   # list of synonym groups
+Y_train = train_data["labels"]   # concept IDs
+
+xmodel = XModel.load_config(".models/xmr4el_base_config.json")
+xmodel.train(X_train, Y_train)
 ```
 
-During training the model:
-- Persists the raw texts and labels temporarily so they can be restored after fitting.
-- Encodes the corpus, builds label embeddings, and prepares sparse training matrices.
-- Constructs a hierarchical tree of classifiers and ranking models.
+Expected file format for this loader:
 
-## Running inference
+- training file:
+  - tab-separated lines of `group_id<TAB>text`
+- label file:
+  - one concept ID per line
+
+Important current behavior:
+- the loader groups all rows with the same `group_id`
+- the grouped rows are aligned to the label list by order
+- if there are fewer labels than grouped text entries, the loader raises an exception
+- if there are more labels than groups, the loader truncates the label list
+
+### Train from PubTator
+
+This path is used in [`_test/xmr4el/test_train_pipeline.py`](_test/xmr4el/test_train_pipeline.py).
 
 ```python
-queries = [
-    "chromosome 10p deletion",
-    "13q deletion syndrome",
-]
+from xmr4el.featurization.preprocessor import Preprocessor
+from xmr4el.xmr.model import XModel
 
-# Request the top 5 labels per query
-scores = model.predict(queries, topk=5)
+train_data = Preprocessor.load_pubtator_file("path/to/corpus_pubtator.txt")
+X_train, Y_train = Preprocessor.organize_pubtator_output(train_data)
 
-# `scores` is a scipy CSR matrix with label scores per query
-# Additional metadata (paths, fused scores) is returned when requesting global mode
+xmodel = XModel.load_config(".models/xmr4el_base_config.json")
+xmodel.train(X_train, Y_train)
 ```
 
-You can adjust the traversal strategy with parameters such as `beam_size`, `fusion` (geometric vs. arithmetic), `topk_mode`, and `topk_inside_global` for exhaustive scoring.
+Current PubTator training behavior:
 
-## Saving and loading models
+- each mention is turned into `"mention [SEP] context"`
+- examples are regrouped by CUI before training
+
+### Save and load a trained model
+
+Implemented by `XModel.save(...)` and `XModel.load(...)`.
 
 ```python
-model.save("artifacts/")
-restored = XModel.load("artifacts/xmodel_2024-05-01_12-00-00")
+xmodel.save("artifacts")
+
+restored = XModel.load("artifacts/xmodel_YYYY-MM-DD_HH-MM-SS")
 ```
 
-The saved directory contains:
-- Serialized hierarchical models (tree structure + trained components).
-- Vectoriser/transformer artefacts used by the `TextEncoder`.
-- Cached training metadata (label mappings, embeddings, configuration).
+The save path contains:
 
-## Customising components
+- `xmodel.pkl`
+- serialized hierarchical model state under `hml/`
+- serialized text encoder state under `text_encoder/`
 
-The following implementations are known to work well and are enabled out of the box (`README.md` in each submodule lists additional options):
+### Run prediction
 
-- **Vectorisers** – `tfidf`
-- **Transformers** – `biobert`, `sentencetbiobert`
-- **Clustering** – `sklearnminibatchkmeans`, `balancedkmeans`
-- **Rankers** – `sklearnlogisticregression`, `sklearnrandomforestclassifier`, `sgdclassifier`
-
-To introduce a new algorithm, add a wrapper under `xmr4el/models` that exposes a `fit`/`predict` compatible interface, then reference it in the configuration dictionaries used when instantiating `XModel`.
-
-## Input data expectations
-
-1. **Label file** – One label identifier per line.
-2. **Training file** – Tab-separated values where each row begins with the index of the corresponding label and is followed by a text mention.
-
-Example label file:
-
-```text
-C538288
-C535484
-C579849
-````
-
-Example training file:
-
-```text
-0\t10p deletion syndrome (partial)
-0\tchromosome 10, 10p- partial
-1\t13q deletion syndrome
+```python
+routes, scores = xmodel.predict(
+    ["mention [SEP] context"],
+    beam_size=5,
+    topk=20,
+    fusion="lp_fusion",
+    topk_mode="global",
+    topk_inside_global=20,
+)
 ```
 
-When loading with `Preprocessor.load_data_labels_from_file` the method:
-- Groups mentions by the numeric label index.
-- Aligns the resulting groups with label IDs.
-- Optionally truncates the dataset for quick experiments.
+The exact return shape depends on `topk_mode`:
 
-Ensure the number of labels matches the number of grouped entries; otherwise an exception is raised.
+- `per_leaf`:
+  - returns the hierarchical model output directly
+- non-`per_leaf`:
+  - returns route information plus a CSR score matrix built from candidate labels gathered from surviving leaves
 
-## Working with Docker
+### Split PubTator files
 
-Use the included [`dockerfile`](dockerfile) to spin up a CUDA-enabled development container.
+[`xmr4el/utils/pubtator_splits.py`](xmr4el/utils/pubtator_splits.py) is a standalone utility for generating train/dev/test PubTator files and optional JSONL exports.
+
+Example:
 
 ```bash
-docker build -t xmr4el .
-docker run -v .:/app --name xmr4el -it xmr4el bash
+python xmr4el/utils/pubtator_splits.py \
+  --input path/to/corpus_pubtator.txt \
+  --outdir datasets/my_split \
+  --emit_jsonl
 ```
 
-Inside the container you may want to activate a virtual environment and set the `PYTHONPATH`:
+The script also supports explicit PMID split files via:
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-```
+- `--train_pmids`
+- `--dev_pmids`
+- `--test_pmids`
 
-Add the export command to `.venv/bin/activate` if you prefer a persistent configuration.
+## Current Status
 
-## Status
+Current state, based on the repository contents:
 
-- Paper: in progress.
-- Implementation: functional but still evolving. Contributions and experimental feedback are welcome – see [`CONTRIBUTING.md`](CONTRIBUTING.md) for guidelines.
+- the main Python package is implemented and importable through `pyproject.toml`
+- one shipped config file exists: `.models/xmr4el_base_config.json`
+- training, saving, loading, and prediction APIs exist on `XModel`
+- biomedical PubTator workflows are explicitly supported by preprocessing utilities and `_test/` scripts
+- UMLS/PostgreSQL helper code exists under `pubtor/`
 
-docker run -d \
-  --name umls_postgres \
-  -p 5432:5432 \
-  -v /Users/vedor/Faculdade/research/xmr4el/.db:/var/lib/postgresql \
-  -v /Users/vedor/Faculdade/research/xmr4el/.umls:/umls \
-  umls_postgres
+## Limitations
+
+These limitations are visible in the current repository.
+
+- The repository is research-oriented and several package-level `README.md` files are still placeholders.
+- `_test/` contains runnable scripts, but the project does not currently present a conventional, documented automated test suite.
+- Setup is environment-sensitive:
+  - `pyproject.toml` declares RAPIDS CUDA dependencies
+  - `requirements.txt` is lighter and not identical
+  - some environments will need manual dependency decisions
+- Several example scripts use local project-relative paths and expect datasets that are not included in the repository.
+- The codebase mixes multiple data assumptions:
+  - grouped synonym-style training
+  - flattened PubTator mention-context examples
+  - new users should inspect the chosen loader carefully before preparing data
+- `pubtor/` uses PostgreSQL via `psycopg2`, but that dependency is not declared in the package metadata.
+
+## TODOs
+
+These are conservative TODOs inferred from the current repository state.
+
+- Replace placeholder module READMEs with implementation-based documentation.
+- Consolidate and document the supported setup paths, especially CPU vs GPU dependency installation.
+- Turn the `_test/` scripts into a clearer, reproducible test or example workflow.
+- Document the expected dataset layouts under `data/` and `datasets/`.
+- Document which configuration combinations are actively maintained.
+
+## Where To Start Reading
+
+For a first pass through the codebase, this order matches the implemented pipeline well:
+
+1. [`pyproject.toml`](pyproject.toml)
+2. [`xmr4el/xmr/model.py`](xmr4el/xmr/model.py)
+3. [`xmr4el/xmr/base.py`](xmr4el/xmr/base.py)
+4. [`xmr4el/featurization/preprocessor.py`](xmr4el/featurization/preprocessor.py)
+5. [`xmr4el/featurization/text_encoder.py`](xmr4el/featurization/text_encoder.py)
+6. [`xmr4el/featurization/label_embedding_factory.py`](xmr4el/featurization/label_embedding_factory.py)
+7. [`xmr4el/clustering/`](xmr4el/clustering)
+8. [`xmr4el/matcher/`](xmr4el/matcher)
+9. [`xmr4el/ranker/`](xmr4el/ranker)
+10. [`_test/xmr4el/`](_test/xmr4el)
