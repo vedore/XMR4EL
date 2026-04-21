@@ -11,4 +11,6 @@ lightgbm
 umap-learn
 fuzzywuzzy
 python-Levenshtein
+memory_profiler
+biopython
 git+https://github.com/kernelmachine/balanced-kmeans.git

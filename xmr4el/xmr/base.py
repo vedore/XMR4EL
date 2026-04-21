@@ -3,8 +3,7 @@ import re
 import gc
 import pickle
 import tempfile
-import joblib
-import heapq
+import logging
 import shutil
 import time
 
@@ -29,13 +28,13 @@ from typing import Tuple
 from uuid import uuid4
 from heapq import nlargest
 from pathlib import Path
+from xmr4el import get_logger
 from xmr4el.clustering.model import Clustering
 from xmr4el.matcher.model import Matcher
 from xmr4el.ranker.model import Ranker
 
 
 model_dir = Path(tempfile.mkdtemp(prefix="ml_model_dir"))
-
 
 class MLModel():
 
@@ -51,6 +50,8 @@ class MLModel():
                  layer=None,
                  n_workers=8,
                  ):
+        
+        self.logger = logging.getLogger(__name__)
         
         self.clustering_config = clustering_config
         self.matcher_config = matcher_config
@@ -245,12 +246,13 @@ class MLModel():
         return model
         
     def __str__(self):
-        _str = f"Cluster Model: {"✔" if self.cluster_model is not None else "✖"}\n" \
-                f"Matcher Model: {"✔" if self.matcher_model is not None else "✖"}\n" \
-                f"Ranker Model: {"✔" if self.ranker_model is not None else "✖"}\n" 
-        return _str
+        return (
+            f"Cluster Model: {self.cluster_model or 'None'}\n"
+            f"Matcher Model: {self.matcher_model or 'None'}\n"
+            f"Ranker Model: {self.ranker_model or 'None'}\n"
+        )
     
-    @profile
+    # @profile
     def fused_predict(self, X, Z, C, alpha=0.5, batch_size=32768,
                       fusion: str = "lp_hinge", p: int = 3):
         """Batched matcher/ranker fusion."""
@@ -332,7 +334,7 @@ class MLModel():
         cluster_fused = entity_fused.dot(C)
         return csr_matrix(cluster_fused)
     
-    @profile
+    # @profile
     def train(self, X_train, Y_train, Z_train, local_to_global, global_to_local):
         """
             X_train: X_processed
@@ -350,8 +352,8 @@ class MLModel():
         
         del global_to_local
         
-        # print("Clustering")
-        # Make the Clustering
+        self.logger.info("Training ML: Clustering Phase")
+        
         cluster_model = Clustering()
         cluster_model.train(Z=self.label_embeddings, 
                             local_to_global_idx=self.local_to_global_idx,
@@ -371,6 +373,8 @@ class MLModel():
         # Retrieve C
         C = self.cluster_model.c_node
         cluster_labels = np.asarray(C.argmax(axis=1)).flatten()
+    
+        self.logger.info("Training ML: Matcher Phase")
     
         # Make the Matcher
         matcher_model = Matcher()  
@@ -407,6 +411,8 @@ class MLModel():
             if self.is_last_layer:
                 P = self.matcher_model.predict_proba(X_train)
                 M_MAN = _topb_sparse(P, b=5)
+            
+            self.logger.info("Training ML: Ranker Phase")
             
             # print("Ranker")
             ranker_model = Ranker()
@@ -684,6 +690,8 @@ class HierarchicaMLModel():
                  n_workers=8,
                  layer=1):
         
+        self.logger = logging.getLogger(__name__)
+        
         self.clustering_config = clustering_config
         self.matcher_config = matcher_config
         self.ranker_config = ranker_config
@@ -803,7 +811,7 @@ class HierarchicaMLModel():
         model.save(str(sub_dir))
         return str(sub_dir)
             
-    @profile
+    # @profile
     def prepare_layer(self, X, Y, Z, C, fused_scores, local_to_global_idx):
         """
         Returns a list of tuples, one per (non-empty) cluster c:
@@ -862,7 +870,7 @@ class HierarchicaMLModel():
 
         return inputs
             
-    @profile
+    # @profile
     def train(self, X_train, Y_train, Z_train, local_to_global, global_to_local):
         """
         Train multiple layers of MLModel; intermediate models are saved in a
@@ -904,6 +912,9 @@ class HierarchicaMLModel():
 
 
             for layer in range(self.layers):
+                
+                self.logger.info(f"Training HML: layer: {layer}")
+                
                 next_inputs: list[tuple] = []
                 ml_list: list[str] = []
                 layer_failed = False
@@ -915,9 +926,16 @@ class HierarchicaMLModel():
                 if self.cut_half_cluster and layer > 0: 
                     n_curr = int(get_n_clusters("n_clusters", 2))
                     set_n_clusters("n_clusters", max(2, n_curr // 2))
+                    
+                number_of_childs = len(inputs)
                 
                 # parent_idx
                 for (X_node, Y_node, Z_node, local_to_label_node, global_to_local_node) in inputs:
+                    
+                    n_child = len(inputs) - number_of_childs
+                    
+                    self.logger.info(f"Training ML: Number {n_child}")
+                    
                     ml = MLModel(
                         clustering_config=self.clustering_config,
                         matcher_config=self.matcher_config,
@@ -945,6 +963,8 @@ class HierarchicaMLModel():
 
                     C = ml.cluster_model.c_node
                     fused_scores = ml.fused_scores
+
+                    self.logger.info(f"Training ML: Preparing Layer")
 
                     # Prepare inputs for next layer
                     raw_children = self.prepare_layer(

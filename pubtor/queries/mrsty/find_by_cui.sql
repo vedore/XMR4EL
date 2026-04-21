@@ -1,0 +1,11 @@
+SELECT
+    CUI,
+    TUI,
+    STN,
+    STY,
+    ATUI,
+    CVF,
+    DUMMY
+FROM MRSTY
+WHERE CUI = %s
+ORDER BY TUI, STY;

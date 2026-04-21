@@ -1,13 +1,18 @@
+import json
 import os
 import joblib
 import pickle
 import time 
 import warnings
+import logging
 
 import numpy as np
 
+from xmr4el import get_logger, set_verbosity
 from numpy import asarray, int32, argpartition, argsort, float32
+from pathlib import Path
 from datetime import datetime
+from typing import Optional
 from memory_profiler import profile
 from scipy.sparse import csr_matrix
 from xmr4el.featurization.label_embedding_factory import LabelEmbeddingFactory
@@ -22,24 +27,38 @@ os.environ["JOBLIB_TEMP_FOLDER"] = "/tmp"
 warnings.filterwarnings("ignore", message=".*does not have valid feature names.*")
 
 
-class XModel():
+class XModel:
     
     def __init__(self, 
-                 vectorizer_config=None,
-                 transformer_config=None,
-                 dimension_config=None,
-                 clustering_config=None,
-                 matcher_config=None,
-                 ranker_config=None,
-                 cur_config=None,
-                 min_leaf_size=20,
-                 max_leaf_size=None,
-                 cut_half_cluster=False,
-                 ranker_every_layer=True,
-                 n_workers=8,
-                 depth=1,
-                 emb_flag=1,
+                 vectorizer_config: dict = None,
+                 transformer_config: dict = None,
+                 dimension_config: dict = None,
+                 clustering_config: dict = None,
+                 matcher_config: dict = None,
+                 ranker_config: dict = None,
+                 cur_config: dict = None,
+                 min_leaf_size: int = 20,
+                 max_leaf_size: int = None,
+                 cut_half_cluster: bool = False,
+                 ranker_every_layer: bool = True,
+                 n_workers: int = 8,
+                 depth: int = 1,
+                 emb_flag: int = 1,
+                 verbose: Optional[int] = None,
+                 logger: Optional[logging.Logger] = None
                  ):
+        
+        # 0 = WARNING, 1 = INFO, 2 = DEBUG
+        if logger is not None:
+            self.logger = logger
+            self.logger.debug("Using user-supplied logger for XModel")
+        else:
+            if verbose is not None:
+                set_verbosity(verbose)
+            self.logger = get_logger("models.xmodel")
+
+        # rest of initialization
+        self.logger.info("Initializing XModel")
         
         self.vectorizer_config = vectorizer_config
         self.transformer_config = transformer_config
@@ -71,6 +90,82 @@ class XModel():
         self.TOPK_DBG = 50
         
         self.temp_var = TempVarStore()
+    
+    def __str__(self) -> str:
+        """Human-friendly multi-line summary of the model and its config/state."""
+        def _short(obj, max_len=100):
+            """Return a short representation for objects (dicts/lists/others)."""
+            try:
+                if obj is None:
+                    return "None"
+                
+                if isinstance(obj, dict):
+                    # show keys and count
+                    keys = list(obj.keys())
+                    k_display = ", ".join(map(str, keys[:6]))
+                    more = f", ... (+{len(keys)-6})" if len(keys) > 6 else ""
+                    return f"dict(keys=[{k_display}{more}])"
+                    
+                if isinstance(obj, (list, tuple, set)):
+                    n = len(obj)
+                    # preview = ", ".join(repr(x) for x in list(obj)[:6])
+                    # more = f", ... (+{n-6})" if n > 6 else ""
+                    return f"{type(obj).__name__}(len={n})"
+                    
+                # for numpy arrays / pandas objects show shape/len if possible
+                if hasattr(obj, "shape"):
+                    return f"{type(obj).__name__}(shape={getattr(obj, 'shape')})"
+                
+                if hasattr(obj, "__len__") and not isinstance(obj, (str, bytes)):
+                    return f"{type(obj).__name__}(len={len(obj)})"
+                
+                r = repr(obj)
+                return r if len(r) <= max_len else r[:max_len] + "..."
+            
+            except Exception:
+                return f"<unrepr {type(obj).__name__}>"
+
+        logger_name = getattr(self, "logger", None)
+        if logger_name is not None:
+            try:
+                logger_info = f"{self.logger.name} (level={self.logger.level})"
+            except Exception:
+                logger_info = repr(self.logger)
+        else:
+            logger_info = "None"
+
+        parts = [
+            f"XModel summary:",
+            f"  logger: {logger_info}",
+            f"  workers: n_workers={self.n_workers}",
+            f"  depth={self.depth}, emb_flag={self.emb_flag}",
+            f"  cluster: min_leaf_size={self.min_leaf_size}, max_leaf_size={self.max_leaf_size}, cut_half_cluster={self.cut_half_cluster}",
+            f"  ranker_every_layer={self.ranker_every_layer}",
+            f"  configs:",
+            f"    vectorizer: {_short(self.vectorizer_config)}",
+            f"    transformer: {_short(self.transformer_config)}",
+            f"    dimension: {_short(self.dimension_config)}",
+            f"    clustering: {_short(self.clustering_config)}",
+            f"    matcher: {_short(self.matcher_config)}",
+            f"    ranker: {_short(self.ranker_config)}",
+            f"    cur: {_short(self.cur_config)}",
+            f"  internal state:",
+            f"    text_encoder: {_short(self._text_encoder)}",
+            f"    hml: {_short(self._hml)}",
+            f"    training_texts: {_short(self._training_texts)}",
+            f"    original_labels: {_short(self._original_labels)}",
+            f"    X/Y/Z: {_short(self._X)}, {_short(self._Y)}, {_short(self._Z)}",
+            f"  temp_var: {_short(getattr(self, 'temp_var', None))}",
+        ]
+        return "\n".join(parts)
+
+    def __repr__(self) -> str:
+        # concise repr that can be used in containers / REPL
+        try:
+            return f"XModel(depth={self.depth}, n_workers={self.n_workers}, emb_flag={self.emb_flag})"
+        except Exception:
+            return "<XModel (repr error)>"
+
     
     @property
     def text_encoder(self):
@@ -187,13 +282,27 @@ class XModel():
         
         return model
     
+    @classmethod
+    def load_config(cls, path: str | Path) -> object:
+        path = Path(path)
+
+        with open(path, "r") as f:
+            data = json.load(f)
+        
+        return XModel(**data)
+        
+    
     def _fit(self, X_text, Y_text):
         """Returns embeddings: ndarray"""
         
         self.initial_labels = self.temp_var.save_model_temp(Y_text)
         self.training_set = self.temp_var.save_model_temp(X_text)
         
-        X_processed, Y_label_to_indices = Preprocessor.prepare_data(X_text, Y_text)
+        self.logger.info("Preparing Data")
+        
+        X_processed, Y_label_to_indices = Preprocessor.prepare_data_older(X_text, Y_text)
+        
+        self.logger.info("Started Encoding")
         
         # Encode X_processed
         text_encoder = TextEncoder(
@@ -215,13 +324,18 @@ class XModel():
         
         return X_emb, Y_binazer, Z 
     
-    @profile
+    # @profile
     def train(self, X_text, Y_text):
+        
+        self.logger.info("Started Training")
+        
         self.X, self.Y, self.Z = self._fit(X_text=X_text, Y_text=Y_text)
 
         n_labels = self.Z.shape[0]
         local_to_global = np.arange(n_labels, dtype=int)
         global_to_local = {g: i for i, g in enumerate(local_to_global)}
+
+        self.logger.info("Hierarchical Model Pipeline")
 
         hml = HierarchicaMLModel(
             clustering_config=self.clustering_config,
@@ -394,3 +508,4 @@ class XModel():
 
             # 6) IMPORTANT: return the SAME 'out' from HMLModel, only scores are replaced by cosine
             return out_h, scores_cos
+    

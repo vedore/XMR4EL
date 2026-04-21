@@ -1,0 +1,13 @@
+SELECT
+    CUI,
+    AUI,
+    ATUI,
+    SATUI,
+    SAB,
+    DEF,
+    SUPPRESS,
+    CVF,
+    DUMMY
+FROM MRDEF
+WHERE CUI = %s
+ORDER BY SAB, AUI;
